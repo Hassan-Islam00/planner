@@ -1,0 +1,99 @@
+{
+  "purpose": "To take care of myself mentally, physically, and spiritually, in order to have the capacity to enjoy life.",
+  "terms": "Goals = long-term\nTasks = weekly\n\nIf it can't be completed in a week, it isn't a task.\nTasks must fit on one page.",
+  "goals": [
+    {
+      "id": 1,
+      "status": "In Progress",
+      "summary": "Bodyweight of 160 lbs",
+      "deadline": "2026-05-01",
+      "parents": [
+        "Physical Health",
+        "Mental Health"
+      ]
+    },
+    {
+      "id": 2,
+      "status": "In Progress",
+      "summary": "Stop Porn Consumption",
+      "deadline": "2026-05-01",
+      "parents": [
+        "Physical Health",
+        "Mental Health"
+      ]
+    },
+    {
+      "id": 3,
+      "status": "In Progress",
+      "summary": "Save $10,000",
+      "deadline": "2026-12-31",
+      "parents": [
+        "Mental Health",
+        "Physical Health"
+      ]
+    },
+    {
+      "id": 4,
+      "status": "In Progress",
+      "summary": "Adhere to this Planner",
+      "deadline": "2026-12-31",
+      "parents": [
+        "Mental Health",
+        "Physical Health",
+        "Spiritual"
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.a",
+      "summary": "Start following a regimented weight-lifting plan. Find a plan on Boost camp.",
+      "parent_goal_id": 1,
+      "status": "In Progress"
+    },
+    {
+      "id": "1.b",
+      "summary": "Eat < 1800 calories",
+      "parent_goal_id": 1,
+      "status": "In Progress"
+    },
+    {
+      "id": "1.c",
+      "summary": "Learn to cook an over-medium egg",
+      "parent_goal_id": 1,
+      "status": "In Progress"
+    },
+    {
+      "id": "2.a",
+      "summary": "Spaced consumption. 1x every two days.",
+      "parent_goal_id": 2,
+      "status": "In Progress"
+    },
+    {
+      "id": "1.d",
+      "summary": "Bedtime ~10:30 \u2013 11:30 pm",
+      "parent_goal_id": 1,
+      "status": "In Progress"
+    },
+    {
+      "id": "4.a",
+      "summary": "Check in every Sunday",
+      "parent_goal_id": 4,
+      "status": "In Progress"
+    },
+    {
+      "id": "3.a",
+      "summary": "Put $50 into TFSA",
+      "parent_goal_id": 3,
+      "status": "In Progress"
+    },
+    {
+      "id": "3.b",
+      "summary": "Spend < $75 a week on outside food",
+      "parent_goal_id": 3,
+      "status": "In Progress"
+    }
+  ],
+  "updated_at": "2026-01-30T01:34:23.334282+00:00",
+  "last_week_closed": null
+}
