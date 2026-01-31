@@ -1,41 +1,23 @@
 """
 One-Page Planner + Weekly Progress Logger (Streamlit)
 
-What it does:
-- Goals are long-term. Tasks persist week-to-week.
-- Each week you manually mark each task: In Progress | Completed | Missed
-- You can only "Close Week" when ALL tasks are marked Completed or Missed (no "unmarked")
-- Closing week:
-    - appends immutable events to progress_log.json (parsable)
-    - resets all task statuses back to In Progress for next week
-    - remembers that this ISO week is already closed (prevents double logging)
-- Tasks are NOT deleted (you can delete manually if you want)
-- Each goal has a Progress Summary that parses the progress log and shows stats + entries.
-
-Files created in the SAME directory as this file:
-- planner_data.json   (current state)
-- progress_log.json   (append-only log)
-
-Run:
-  python3 -m pip install streamlit
-  python3 -m streamlit run app.py
+Google Drive persistence version:
+- planner_data.json and progress_log.json live in a Drive folder (by folder_id)
+- Streamlit Secrets must include drive_folder_id + gcp_service_account
 """
 
 import json
-import os
 import re
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
-from pathlib import Path
 
 import streamlit as st
 
-# ----------------------------
-# Paths
-# ----------------------------
-APP_DIR = Path(__file__).resolve().parent
-DATA_FILE = APP_DIR / "planner_data.json"
-PROGRESS_FILE = APP_DIR / "progress_log.json"
+# Google Drive API
+import io
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 
 # ----------------------------
 # Constants
@@ -44,6 +26,8 @@ DEFAULT_PARENTS = ["Mental Health", "Physical Health", "Spiritual"]
 TASK_STATUSES = ["In Progress", "Completed", "Missed"]
 GOAL_STATUSES = ["In Progress", "Done", "Psyche"]
 
+DATA_FILENAME = "planner_data.json"
+PROGRESS_FILENAME = "progress_log.json"
 
 # ----------------------------
 # Data model
@@ -73,48 +57,123 @@ def now_iso() -> str:
 
 
 def current_iso_week() -> str:
-    # ISO week starts Monday. Example: "2026-W05"
     y, w, _ = date.today().isocalendar()
     return f"{y}-W{w:02d}"
 
 
 # ----------------------------
-# Persistence helpers
+# Google Drive helpers
+# ----------------------------
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+@st.cache_resource
+def drive_service():
+    """
+    Builds and caches the Drive API client.
+    Requires Streamlit Secrets:
+      - st.secrets["gcp_service_account"] (dict)
+    """
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=SCOPES,
+    )
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _find_file_id_in_folder(svc, folder_id: str, filename: str) -> str | None:
+    q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
+    res = svc.files().list(q=q, fields="files(id,name)").execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def _download_json(svc, file_id: str, default_obj):
+    req = svc.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.seek(0)
+    raw = fh.read()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return default_obj
+
+
+def _upload_json(svc, folder_id: str, filename: str, obj, file_id: str | None):
+    payload = json.dumps(obj, indent=2).encode("utf-8")
+    media = MediaInMemoryUpload(payload, mimetype="application/json", resumable=False)
+
+    if file_id:
+        svc.files().update(fileId=file_id, media_body=media).execute()
+    else:
+        svc.files().create(
+            body={"name": filename, "parents": [folder_id]},
+            media_body=media,
+            fields="id",
+        ).execute()
+
+
+def _folder_id() -> str:
+    # Secrets key: drive_folder_id
+    return st.secrets["drive_folder_id"]
+
+
+# ----------------------------
+# Persistence (Drive-backed)
 # ----------------------------
 def load_data() -> dict:
-    if DATA_FILE.exists():
-        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    svc = drive_service()
+    folder_id = _folder_id()
+
+    fid = _find_file_id_in_folder(svc, folder_id, DATA_FILENAME)
+    if fid:
+        return _download_json(svc, fid, default_obj={})
+
+    # First run: no file exists yet
     return {
         "purpose": "To take care of myself mentally, physically, and spiritually, in order to have the capacity to enjoy life.",
         "terms": "Goals = long-term\nTasks = weekly\n\nIf it can't be completed in a week, it isn't a task.\nTasks must fit on one page.",
         "goals": [],
         "tasks": [],
         "updated_at": now_iso(),
-        "last_week_closed": None,  # e.g. "2026-W05"
+        "last_week_closed": None,
     }
 
 
 def save_data(data: dict) -> None:
     data["updated_at"] = now_iso()
-    tmp = DATA_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    os.replace(tmp, DATA_FILE)
+
+    svc = drive_service()
+    folder_id = _folder_id()
+    fid = _find_file_id_in_folder(svc, folder_id, DATA_FILENAME)
+    _upload_json(svc, folder_id, DATA_FILENAME, data, fid)
 
 
 def load_progress_log() -> list[dict]:
-    if PROGRESS_FILE.exists():
-        return json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
+    svc = drive_service()
+    folder_id = _folder_id()
+
+    fid = _find_file_id_in_folder(svc, folder_id, PROGRESS_FILENAME)
+    if fid:
+        return _download_json(svc, fid, default_obj=[])
     return []
 
 
 def append_progress_events(events: list[dict]) -> None:
     """
-    Append-only log. We do a full rewrite for simplicity.
-    If you want true append streaming later, we can switch to NDJSON.
+    Drive-backed append. (Read -> extend -> write)
+    For solo use this is fine. For multiple users you'd want DB/locking.
     """
     log = load_progress_log()
     log.extend(events)
-    PROGRESS_FILE.write_text(json.dumps(log, indent=2), encoding="utf-8")
+
+    svc = drive_service()
+    folder_id = _folder_id()
+    fid = _find_file_id_in_folder(svc, folder_id, PROGRESS_FILENAME)
+    _upload_json(svc, folder_id, PROGRESS_FILENAME, log, fid)
 
 
 # ----------------------------
@@ -125,7 +184,6 @@ def next_goal_id(goals: list[dict]) -> int:
 
 
 def next_task_id_for_goal(tasks: list[dict], goal_id: int) -> str:
-    # Allocate <goalId>.<letter>, skipping letters already used under that goal
     used = set()
     pat = re.compile(rf"^{re.escape(str(goal_id))}\.([a-z])$", re.IGNORECASE)
 
@@ -148,10 +206,6 @@ def next_task_id_for_goal(tasks: list[dict], goal_id: int) -> str:
 # Progress summary
 # ----------------------------
 def goal_progress_summary(goal_id: int):
-    """
-    Stats computed from immutable progress log.
-    Returns: completed_count, missed_count, total_logged, completion_rate_percent, events_for_goal
-    """
     log = load_progress_log()
     events = [e for e in log if e.get("goal_id") == goal_id]
 
@@ -167,12 +221,18 @@ def goal_progress_summary(goal_id: int):
 # UI
 # ----------------------------
 st.set_page_config(page_title="One-Page Planner", layout="wide")
-data = load_data()
 week = current_iso_week()
+
+# Helpful early failure message if secrets aren't set
+if "drive_folder_id" not in st.secrets or "gcp_service_account" not in st.secrets:
+    st.error("Missing Streamlit Secrets. You need drive_folder_id and [gcp_service_account].")
+    st.stop()
+
+data = load_data()
 
 st.title("One-Page Planner")
 st.caption(f"Week: **{week}**")
-st.caption(f"State: {DATA_FILE.name} • Log: {PROGRESS_FILE.name}")
+st.caption(f"Persistence: Google Drive folder **{st.secrets['drive_folder_id']}** • Files: {DATA_FILENAME}, {PROGRESS_FILENAME}")
 
 # Purpose + Terms (auto-save)
 colA, colB = st.columns(2)
@@ -213,7 +273,7 @@ with st.expander("➕ Add Goal", expanded=False):
             st.success(f"Created Goal ({gid}).")
 
 # ----------------------------
-# Add Task (must choose goal; auto task id)
+# Add Task
 # ----------------------------
 with st.expander("➕ Add Task", expanded=False):
     if not data["goals"]:
@@ -245,7 +305,7 @@ with st.expander("➕ Add Task", expanded=False):
 st.divider()
 
 # ----------------------------
-# Weekly Tasks (persisting list)
+# Weekly Tasks
 # ----------------------------
 st.subheader("Weekly Tasks (persisting list)")
 
@@ -259,7 +319,6 @@ else:
             st.write(t["summary"])
             st.caption(f"Goal: {t['parent_goal_id']}")
 
-            # Status dropdown (manual)
             current_status = t.get("status", "In Progress")
             if current_status not in TASK_STATUSES:
                 current_status = "In Progress"
@@ -275,7 +334,6 @@ else:
                 t["status"] = new_status
                 save_data(data)
 
-            # Manual delete (user prerogative)
             if st.button("Delete task", key=f"del_task_{t['id']}"):
                 data["tasks"] = [tt for tt in data["tasks"] if tt["id"] != t["id"]]
                 save_data(data)
@@ -284,7 +342,7 @@ else:
 st.divider()
 
 # ----------------------------
-# Close Week (log + reset statuses; no deletion)
+# Close Week
 # ----------------------------
 st.subheader("Close Week")
 
@@ -310,7 +368,6 @@ else:
             elif status == "Missed":
                 ev = "missed"
             else:
-                # Should never happen due to gating, but keep safe:
                 continue
 
             events.append({
@@ -324,7 +381,6 @@ else:
 
         append_progress_events(events)
 
-        # Reset weekly statuses for next week (keep tasks)
         for t in data["tasks"]:
             t["status"] = "In Progress"
 
@@ -337,7 +393,7 @@ else:
 st.divider()
 
 # ----------------------------
-# Goal Progress Summary (parses progress_log.json)
+# Goal Progress Summary
 # ----------------------------
 st.subheader("Goal Progress Summary")
 
@@ -363,20 +419,4 @@ st.divider()
 
 # ----------------------------
 # Downloads (optional)
-# ----------------------------
-st.download_button(
-    "Download planner_data.json",
-    data=json.dumps(data, indent=2),
-    file_name="planner_data.json",
-    mime="application/json",
-    key="dl_state",
-)
-
-progress_log = load_progress_log()
-st.download_button(
-    "Download progress_log.json",
-    data=json.dumps(progress_log, indent=2),
-    file_name="progress_log.json",
-    mime="application/json",
-    key="dl_log",
-)
+# ---------------------
