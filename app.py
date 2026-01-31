@@ -22,6 +22,9 @@ DATA_FILENAME = "planner_data.json"
 PROGRESS_FILENAME = "progress_log.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
+st.sidebar.write("drive_folder_id:", st.secrets.get("drive_folder_id"))
+st.sidebar.write("service account:", st.secrets.get("gcp_service_account", {}).get("client_email"))
+
 
 # ----------------------------
 # Data model
