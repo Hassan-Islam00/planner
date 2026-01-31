@@ -1,50 +1,3 @@
-"""
-One-Page Planner + Weekly Progress Logger (Streamlit)
-Google Drive persistence + View-only for friends + Editor-only edits for you.
-
-What it does:
-- Goals are long-term. Tasks persist week-to-week.
-- Each week you manually mark each task: In Progress | Completed | Missed
-- You can only "Close Week" when ALL tasks are marked Completed or Missed
-- Closing week:
-    - appends immutable events to progress_log.json (parsable)
-    - resets all task statuses back to In Progress for next week
-    - remembers that this ISO week is already closed (prevents double logging)
-- Tasks are NOT deleted (you can delete manually if you want)
-- Each goal has a Progress Summary that parses the progress log and shows stats + entries.
-
-Persistence:
-- planner_data.json and progress_log.json are stored in a Google Drive folder.
-
-Auth:
-- Friends can view.
-- Only you can edit after entering edit password (stored in Streamlit Secrets).
-
-Streamlit Secrets (TOML):
-drive_folder_id = "YOUR_FOLDER_ID"
-edit_password = "YOUR_LONG_PASSWORD"
-
-[gcp_service_account]
-type = "service_account"
-project_id = "..."
-private_key_id = "..."
-private_key = """-----BEGIN PRIVATE KEY-----
-...
------END PRIVATE KEY-----"""
-client_email = "..."
-client_id = "..."
-auth_uri = "https://accounts.google.com/o/oauth2/auth"
-token_uri = "https://oauth2.googleapis.com/token"
-auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-client_x509_cert_url = "..."
-universe_domain = "googleapis.com"
-
-requirements.txt:
-streamlit
-google-api-python-client
-google-auth
-"""
-
 import json
 import re
 import io
@@ -58,7 +11,6 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 
-
 # ----------------------------
 # Constants
 # ----------------------------
@@ -68,9 +20,7 @@ GOAL_STATUSES = ["In Progress", "Done", "Psyche"]
 
 DATA_FILENAME = "planner_data.json"
 PROGRESS_FILENAME = "progress_log.json"
-
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-
 
 # ----------------------------
 # Data model
@@ -86,10 +36,10 @@ class Goal:
 
 @dataclass
 class Task:
-    id: str                 # auto-generated: <goalId>.<letter>
+    id: str
     summary: str
     parent_goal_id: int
-    status: str = "In Progress"   # weekly status
+    status: str = "In Progress"
 
 
 # ----------------------------
@@ -100,7 +50,6 @@ def now_iso() -> str:
 
 
 def current_iso_week() -> str:
-    # ISO week starts Monday. Example: "2026-W05"
     y, w, _ = date.today().isocalendar()
     return f"{y}-W{w:02d}"
 
@@ -115,7 +64,6 @@ def is_editor() -> bool:
 def editor_login_ui():
     with st.sidebar:
         st.markdown("### 🔒 Editor")
-
         if is_editor():
             st.success("Editing enabled")
             if st.button("Log out (view-only)", key="btn_logout"):
@@ -126,7 +74,6 @@ def editor_login_ui():
             if pw and hmac.compare_digest(pw, st.secrets["edit_password"]):
                 st.session_state["is_editor"] = True
                 st.rerun()
-
             st.caption("Viewers can browse. Editing requires the password.")
 
 
@@ -139,7 +86,6 @@ def drive_service():
         st.secrets["gcp_service_account"],
         scopes=SCOPES,
     )
-    # cache_discovery=False avoids warnings in some environments
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -148,7 +94,6 @@ def _folder_id() -> str:
 
 
 def _find_file_id_in_folder(svc, folder_id: str, filename: str) -> str | None:
-    # Shared Drive safe
     q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
     res = (
         svc.files()
@@ -172,9 +117,8 @@ def _download_json(svc, file_id: str, default_obj):
     while not done:
         _, done = downloader.next_chunk()
     fh.seek(0)
-    raw = fh.read()
     try:
-        return json.loads(raw.decode("utf-8"))
+        return json.loads(fh.read().decode("utf-8"))
     except Exception:
         return default_obj
 
@@ -184,11 +128,7 @@ def _upload_json(svc, folder_id: str, filename: str, obj, file_id: str | None):
     media = MediaInMemoryUpload(payload, mimetype="application/json", resumable=False)
 
     if file_id:
-        svc.files().update(
-            fileId=file_id,
-            media_body=media,
-            supportsAllDrives=True,
-        ).execute()
+        svc.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
     else:
         svc.files().create(
             body={"name": filename, "parents": [folder_id]},
@@ -199,9 +139,6 @@ def _upload_json(svc, folder_id: str, filename: str, obj, file_id: str | None):
 
 
 def ensure_folder_access_or_stop():
-    """
-    Hard-fail early with a helpful message if folder_id is wrong or not shared to the service account.
-    """
     svc = drive_service()
     folder_id = _folder_id()
     try:
@@ -213,19 +150,19 @@ def ensure_folder_access_or_stop():
         if meta.get("mimeType") != "application/vnd.google-apps.folder":
             st.error("drive_folder_id does not point to a folder. Check the ID.")
             st.stop()
-    except Exception:
+    except Exception as e:
         st.error(
             "Google Drive folder is not accessible to the service account.\n\n"
             "Fix:\n"
             "1) Confirm drive_folder_id is the folder ID (from /drive/folders/<ID>)\n"
             "2) Share the folder with the service account email as Editor\n"
-            "3) If it’s a Shared Drive, ensure the service account has access"
         )
+        st.exception(e)
         st.stop()
 
 
 # ----------------------------
-# Persistence (Drive-backed)
+# Persistence
 # ----------------------------
 def load_data() -> dict:
     svc = drive_service()
@@ -234,7 +171,6 @@ def load_data() -> dict:
     fid = _find_file_id_in_folder(svc, folder_id, DATA_FILENAME)
     if fid:
         obj = _download_json(svc, fid, default_obj={})
-        # If file exists but is empty/corrupt, fall back to defaults
         if isinstance(obj, dict) and obj:
             return obj
 
@@ -244,13 +180,12 @@ def load_data() -> dict:
         "goals": [],
         "tasks": [],
         "updated_at": now_iso(),
-        "last_week_closed": None,  # e.g. "2026-W05"
+        "last_week_closed": None,
     }
 
 
 def save_data(data: dict) -> None:
     data["updated_at"] = now_iso()
-
     svc = drive_service()
     folder_id = _folder_id()
     fid = _find_file_id_in_folder(svc, folder_id, DATA_FILENAME)
@@ -260,7 +195,6 @@ def save_data(data: dict) -> None:
 def load_progress_log() -> list[dict]:
     svc = drive_service()
     folder_id = _folder_id()
-
     fid = _find_file_id_in_folder(svc, folder_id, PROGRESS_FILENAME)
     if fid:
         obj = _download_json(svc, fid, default_obj=[])
@@ -269,10 +203,6 @@ def load_progress_log() -> list[dict]:
 
 
 def append_progress_events(events: list[dict]) -> None:
-    """
-    Drive-backed append (read -> extend -> write).
-    For solo use, fine. For multi-user, move to a DB.
-    """
     log = load_progress_log()
     log.extend(events)
 
@@ -314,5 +244,232 @@ def next_task_id_for_goal(tasks: list[dict], goal_id: int) -> str:
 def goal_progress_summary(goal_id: int):
     log = load_progress_log()
     events = [e for e in log if e.get("goal_id") == goal_id]
+    completed = sum(1 for e in events if e.get("event") == "completed")
+    missed = sum(1 for e in events if e.get("event") == "missed")
+    total = completed + missed
+    rate = 0.0 if total == 0 else round(100.0 * completed / total, 1)
+    return completed, missed, total, rate, events
 
-    comple
+
+# ----------------------------
+# UI
+# ----------------------------
+st.set_page_config(page_title="One-Page Planner", layout="wide")
+
+# Secrets guard
+needed = ("drive_folder_id", "gcp_service_account", "edit_password")
+missing = [k for k in needed if k not in st.secrets]
+if missing:
+    st.error(f"Missing Streamlit Secrets: {', '.join(missing)}")
+    st.stop()
+
+editor_login_ui()
+can_edit = is_editor()
+
+ensure_folder_access_or_stop()
+
+data = load_data()
+week = current_iso_week()
+
+st.title("One-Page Planner")
+st.caption(f"Week: **{week}**")
+if not can_edit:
+    st.info("👀 View-only mode. Editing is disabled.")
+
+# Purpose + Terms
+colA, colB = st.columns(2)
+with colA:
+    new_purpose = st.text_area("Purpose", data.get("purpose", ""), height=100, disabled=not can_edit)
+with colB:
+    new_terms = st.text_area("Terms / Rules", data.get("terms", ""), height=100, disabled=not can_edit)
+
+if can_edit and (new_purpose != data.get("purpose") or new_terms != data.get("terms")):
+    data["purpose"] = new_purpose
+    data["terms"] = new_terms
+    save_data(data)
+
+st.divider()
+
+# Add Goal
+with st.expander("➕ Add Goal", expanded=False):
+    g_summary = st.text_input("Goal summary", key="g_summary", disabled=not can_edit)
+    g_deadline = st.date_input("Deadline", value=date.today(), key="g_deadline", disabled=not can_edit)
+    g_status = st.selectbox("Goal status", GOAL_STATUSES, index=0, key="g_status", disabled=not can_edit)
+    g_parents = st.multiselect("Parents", DEFAULT_PARENTS, default=[], key="g_parents", disabled=not can_edit)
+
+    if st.button("Create Goal", key="btn_create_goal", disabled=not can_edit):
+        if not g_summary.strip():
+            st.error("Goal summary can't be empty.")
+        else:
+            gid = next_goal_id(data["goals"])
+            data["goals"].append(asdict(Goal(
+                id=gid,
+                status=g_status,
+                summary=g_summary.strip(),
+                deadline=g_deadline.isoformat(),
+                parents=g_parents
+            )))
+            save_data(data)
+            st.success(f"Created Goal ({gid}).")
+
+# Add Task
+with st.expander("➕ Add Task", expanded=False):
+    if not data["goals"]:
+        st.info("Create a goal first.")
+    else:
+        t_summary = st.text_input("Task summary", key="t_summary", disabled=not can_edit)
+        goal_options = {f'Goal {g["id"]}: {g["summary"]}': g["id"] for g in data["goals"]}
+        selected_goal_label = st.selectbox(
+            "Parent goal (required)",
+            list(goal_options.keys()),
+            key="t_parent",
+            disabled=not can_edit
+        )
+        selected_goal_id = goal_options[selected_goal_label]
+
+        preview_id = next_task_id_for_goal(data["tasks"], selected_goal_id)
+        st.caption(f"Task ID will be: **{preview_id}**")
+
+        if st.button("Create Task", key="btn_create_task", disabled=not can_edit):
+            if not t_summary.strip():
+                st.error("Task summary is required.")
+            else:
+                tid = next_task_id_for_goal(data["tasks"], selected_goal_id)
+                data["tasks"].append(asdict(Task(
+                    id=tid,
+                    summary=t_summary.strip(),
+                    parent_goal_id=selected_goal_id,
+                    status="In Progress"
+                )))
+                save_data(data)
+                st.success(f"Created Task ({tid}).")
+
+st.divider()
+
+# Weekly Tasks
+st.subheader("Weekly Tasks (persisting list)")
+
+if not data["tasks"]:
+    st.info("No tasks yet.")
+else:
+    cols = st.columns(3)
+    for i, t in enumerate(data["tasks"]):
+        with cols[i % 3]:
+            st.markdown(f"### {t['id']}")
+            st.write(t["summary"])
+            st.caption(f"Goal: {t['parent_goal_id']}")
+
+            current_status = t.get("status", "In Progress")
+            if current_status not in TASK_STATUSES:
+                current_status = "In Progress"
+
+            new_status = st.selectbox(
+                "Weekly status",
+                TASK_STATUSES,
+                index=TASK_STATUSES.index(current_status),
+                key=f"task_status_{t['id']}",
+                disabled=not can_edit
+            )
+
+            if can_edit and new_status != current_status:
+                t["status"] = new_status
+                save_data(data)
+
+            if st.button("Delete task", key=f"del_task_{t['id']}", disabled=not can_edit):
+                data["tasks"] = [tt for tt in data["tasks"] if tt["id"] != t["id"]]
+                save_data(data)
+                st.rerun()
+
+st.divider()
+
+# Close Week
+st.subheader("Close Week")
+
+if data.get("last_week_closed") == week:
+    st.info("This week has already been closed/logged.")
+else:
+    in_progress = [t for t in data["tasks"] if t.get("status") == "In Progress"]
+    close_disabled = bool(in_progress)
+
+    if in_progress:
+        st.error(
+            f"{len(in_progress)} task(s) are still **In Progress**.\n\n"
+            "Mark every task as **Completed** or **Missed** before closing the week."
+        )
+
+    if st.button(
+        "✅ Confirm week is over (log results + reset)",
+        key="btn_close_week",
+        disabled=(close_disabled or not can_edit)
+    ):
+        events = []
+        for t in data["tasks"]:
+            status = t.get("status", "In Progress")
+            if status == "Completed":
+                ev = "completed"
+            elif status == "Missed":
+                ev = "missed"
+            else:
+                continue
+
+            events.append({
+                "timestamp": now_iso(),
+                "week": week,
+                "goal_id": t["parent_goal_id"],
+                "task_id": t["id"],
+                "event": ev,
+                "summary": t["summary"],
+            })
+
+        append_progress_events(events)
+
+        for t in data["tasks"]:
+            t["status"] = "In Progress"
+
+        data["last_week_closed"] = week
+        save_data(data)
+
+        st.success("Week logged. Tasks kept. Statuses reset.")
+        st.rerun()
+
+st.divider()
+
+# Goal Progress Summary
+st.subheader("Goal Progress Summary")
+
+if not data["goals"]:
+    st.info("No goals yet.")
+else:
+    for g in data["goals"]:
+        with st.expander(f"📊 Goal {g['id']}: {g['summary']}"):
+            completed, missed, total, rate, events = goal_progress_summary(g["id"])
+            st.metric("Completion rate", f"{rate}%", f"{completed}/{total} (completed/total)")
+            st.write(f"Missed: **{missed}**")
+
+            if not events:
+                st.caption("No log entries yet for this goal.")
+            else:
+                st.write("Recent log entries (newest last):")
+                for e in events[-50:]:
+                    emoji = "✅" if e.get("event") == "completed" else "❌"
+                    st.write(f"{emoji} **{e.get('week','')}** — {e.get('task_id','')} — {e.get('summary','')}")
+
+st.divider()
+
+# Downloads
+st.download_button(
+    "Download planner_data.json",
+    data=json.dumps(data, indent=2),
+    file_name="planner_data.json",
+    mime="application/json",
+    key="dl_state",
+)
+
+progress_log = load_progress_log()
+st.download_button(
+    "Download progress_log.json",
+    data=json.dumps(progress_log, indent=2),
+    file_name="progress_log.json",
+    mime="application/json",
+    key="dl_log",
+)
