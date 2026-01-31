@@ -20,7 +20,8 @@ GOAL_STATUSES = ["In Progress", "Done", "Psyche"]
 
 DATA_FILENAME = "planner_data.json"
 PROGRESS_FILENAME = "progress_log.json"
-SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
 
 # ----------------------------
 # Data model
