@@ -418,7 +418,7 @@ else:
     if can_edit and changed_any and not saving():
         safe_save_data(data)
         st.rerun()
-v
+
 
 # Close Week
 st.subheader("Close Week")
