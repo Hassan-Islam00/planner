@@ -3,11 +3,17 @@ import re
 import io
 import hmac
 import copy
+import time
+import random
+import ssl
+import socket
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
 
 import streamlit as st
 
+import httplib2
+import google_auth_httplib2
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
@@ -25,9 +31,11 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # Session-state keys
 SS_WORKING = "working_data"          # local working copy (browser session)
-SS_LOADED_AT = "working_loaded_at"   # last known updated_at from drive when we loaded
+SS_LOADED_AT = "working_loaded_at"   # updated_at at time of load (for warnings)
 SS_DIRTY = "working_dirty"
 SS_SAVING = "working_saving"
+SS_DRIVE_READY = "drive_ready"
+SS_PROGRESS = "progress_cache"       # cached progress log (loaded only when user asks)
 
 # ----------------------------
 # Data model
@@ -91,37 +99,6 @@ def saving() -> bool:
     return bool(st.session_state.get(SS_SAVING, False))
 
 
-def ensure_drive_ready_once_or_stop():
-    # Only run the Drive folder check once per browser session
-    if st.session_state.get("_drive_ready", False):
-        return
-
-    svc = drive_service()
-    folder_id = _folder_id()
-    try:
-        meta = svc.files().get(
-            fileId=folder_id,
-            fields="id,name,mimeType",
-            supportsAllDrives=True,
-        ).execute()
-        if meta.get("mimeType") != "application/vnd.google-apps.folder":
-            st.error("drive_folder_id does not point to a folder. Check the ID.")
-            st.stop()
-
-        st.session_state["_drive_ready"] = True  # success => don't check again
-
-    except Exception as e:
-        st.error(
-            "Google Drive folder is not accessible to the service account.\n\n"
-            "Fix:\n"
-            "1) Confirm drive_folder_id is the folder ID (from /drive/folders/<ID>)\n"
-            "2) Share the folder with the service account email as Editor\n"
-        )
-        st.exception(e)
-        st.stop()
-
-
-
 def mark_dirty():
     st.session_state[SS_DIRTY] = True
 
@@ -135,33 +112,79 @@ def is_dirty() -> bool:
 
 
 # ----------------------------
-# Google Drive helpers
+# Google Drive helpers (with timeout + retries)
 # ----------------------------
 @st.cache_resource
 def drive_service():
+    """
+    Create a Drive service with explicit httplib2 timeout.
+    Streamlit Cloud can have flaky TLS; this reduces long hangs and makes retries cleaner.
+    """
     creds = service_account.Credentials.from_service_account_info(
         st.secrets["gcp_service_account"],
         scopes=SCOPES,
     )
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+    http = httplib2.Http(timeout=60)
+    authed_http = google_auth_httplib2.AuthorizedHttp(creds, http=http)
+    return build("drive", "v3", http=authed_http, cache_discovery=False)
 
 
 def _folder_id() -> str:
     return st.secrets["drive_folder_id"]
 
 
+def _retryable_exc(e: Exception) -> bool:
+    # Treat transient network/TLS/timeouts as retryable
+    if isinstance(e, (ssl.SSLError, socket.timeout, TimeoutError, ConnectionError)):
+        return True
+    msg = str(e).lower()
+    # common transient strings
+    transient_markers = [
+        "decryption failed",
+        "bad record mac",
+        "ssl",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "connection aborted",
+        "broken pipe",
+        "server disconnected",
+        "503",
+        "502",
+        "500",
+        "429",
+    ]
+    return any(m in msg for m in transient_markers)
+
+
+def _execute_with_retries(req, what: str = "google api", max_tries: int = 5):
+    """
+    Wrap .execute() with exponential backoff.
+    """
+    base = 0.6
+    last = None
+    for i in range(max_tries):
+        try:
+            return req.execute()
+        except Exception as e:
+            last = e
+            if not _retryable_exc(e) or i == max_tries - 1:
+                raise
+            # exponential backoff + jitter
+            sleep_s = base * (2 ** i) + random.uniform(0, 0.35)
+            time.sleep(sleep_s)
+    raise last  # should never reach
+
+
 def _find_file_id_in_folder(svc, folder_id: str, filename: str) -> str | None:
     q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
-    res = (
-        svc.files()
-        .list(
-            q=q,
-            fields="files(id,name)",
-            supportsAllDrives=True,
-            includeItemsFromAllDrives=True,
-        )
-        .execute()
+    req = svc.files().list(
+        q=q,
+        fields="files(id,name)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
     )
+    res = _execute_with_retries(req, what=f"list {filename}")
     files = res.get("files", [])
     return files[0]["id"] if files else None
 
@@ -170,9 +193,19 @@ def _download_json(svc, file_id: str, default_obj):
     req = svc.files().get_media(fileId=file_id, supportsAllDrives=True)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, req)
+
     done = False
+    # next_chunk() has its own retry logic, but we still wrap transient failures
+    tries = 0
     while not done:
-        _, done = downloader.next_chunk()
+        try:
+            _, done = downloader.next_chunk()
+        except Exception as e:
+            tries += 1
+            if not _retryable_exc(e) or tries >= 5:
+                raise
+            time.sleep(0.6 * (2 ** (tries - 1)) + random.uniform(0, 0.35))
+
     fh.seek(0)
     try:
         return json.loads(fh.read().decode("utf-8"))
@@ -185,52 +218,56 @@ def _upload_json(svc, folder_id: str, filename: str, obj, file_id: str | None):
     media = MediaInMemoryUpload(payload, mimetype="application/json", resumable=False)
 
     if file_id:
-        svc.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
+        req = svc.files().update(fileId=file_id, media_body=media, supportsAllDrives=True)
+        _execute_with_retries(req, what=f"update {filename}")
     else:
-        svc.files().create(
+        req = svc.files().create(
             body={"name": filename, "parents": [folder_id]},
             media_body=media,
             fields="id",
             supportsAllDrives=True,
-        ).execute()
+        )
+        _execute_with_retries(req, what=f"create {filename}")
 
 
-def ensure_folder_access_or_stop():
+def ensure_drive_ready_once_or_stop():
+    """
+    IMPORTANT: This *reads* Drive. We run it once per browser session.
+    It does NOT write anything.
+    """
+    if st.session_state.get(SS_DRIVE_READY, False):
+        return
+
     svc = drive_service()
     folder_id = _folder_id()
+
     try:
-        meta = svc.files().get(
+        req = svc.files().get(
             fileId=folder_id,
             fields="id,name,mimeType",
             supportsAllDrives=True,
-        ).execute()
+        )
+        meta = _execute_with_retries(req, what="folder metadata")
         if meta.get("mimeType") != "application/vnd.google-apps.folder":
             st.error("drive_folder_id does not point to a folder. Check the ID.")
             st.stop()
+        st.session_state[SS_DRIVE_READY] = True
     except Exception as e:
         st.error(
-            "Google Drive folder is not accessible to the service account.\n\n"
+            "Google Drive folder is not accessible right now.\n\n"
             "Fix:\n"
             "1) Confirm drive_folder_id is the folder ID (from /drive/folders/<ID>)\n"
-            "2) Share the folder with the service account email as Editor\n"
+            "2) Share the folder with the service account email as Editor\n\n"
+            "If this is Streamlit Cloud being flaky, hit Reload and try again."
         )
         st.exception(e)
         st.stop()
 
 
 # ----------------------------
-# Persistence
+# Persistence (planner_data.json)
 # ----------------------------
-def load_data() -> dict:
-    svc = drive_service()
-    folder_id = _folder_id()
-
-    fid = _find_file_id_in_folder(svc, folder_id, DATA_FILENAME)
-    if fid:
-        obj = _download_json(svc, fid, default_obj={})
-        if isinstance(obj, dict) and obj:
-            return obj
-
+def default_data() -> dict:
     return {
         "purpose": "To take care of myself mentally, physically, and spiritually, in order to have the capacity to enjoy life.",
         "terms": "Goals = long-term\nTasks = weekly\n\nIf it can't be completed in a week, it isn't a task.\nTasks must fit on one page.",
@@ -241,7 +278,20 @@ def load_data() -> dict:
     }
 
 
-def save_data(data: dict) -> None:
+def load_data_from_drive() -> dict:
+    svc = drive_service()
+    folder_id = _folder_id()
+
+    fid = _find_file_id_in_folder(svc, folder_id, DATA_FILENAME)
+    if fid:
+        obj = _download_json(svc, fid, default_obj={})
+        if isinstance(obj, dict) and obj:
+            return obj
+
+    return default_data()
+
+
+def save_data_to_drive(data: dict) -> None:
     data["updated_at"] = now_iso()
     svc = drive_service()
     folder_id = _folder_id()
@@ -249,7 +299,10 @@ def save_data(data: dict) -> None:
     _upload_json(svc, folder_id, DATA_FILENAME, data, fid)
 
 
-def load_progress_log() -> list[dict]:
+# ----------------------------
+# Progress log (loaded only when user asks)
+# ----------------------------
+def load_progress_log_from_drive() -> list[dict]:
     svc = drive_service()
     folder_id = _folder_id()
     fid = _find_file_id_in_folder(svc, folder_id, PROGRESS_FILENAME)
@@ -260,15 +313,21 @@ def load_progress_log() -> list[dict]:
 
 
 def append_progress_events(events: list[dict]) -> None:
-    # NOTE: progress log is separate from planner_data.json.
-    # This function writes to Drive immediately (by design) when you close a week.
-    log = load_progress_log()
+    """
+    Writes progress_log.json immediately.
+    If you want *zero* Drive writes except Save, tell me and I’ll buffer these too.
+    """
+    log = load_progress_log_from_drive()
     log.extend(events)
 
     svc = drive_service()
     folder_id = _folder_id()
     fid = _find_file_id_in_folder(svc, folder_id, PROGRESS_FILENAME)
     _upload_json(svc, folder_id, PROGRESS_FILENAME, log, fid)
+
+    # keep local cache in sync if it's loaded
+    if SS_PROGRESS in st.session_state:
+        st.session_state[SS_PROGRESS] = log
 
 
 # ----------------------------
@@ -298,10 +357,10 @@ def next_task_id_for_goal(tasks: list[dict], goal_id: int) -> str:
 
 
 # ----------------------------
-# Progress summary
+# Progress summary (uses cached log only)
 # ----------------------------
-def goal_progress_summary(goal_id: int):
-    log = load_progress_log()
+def goal_progress_summary_cached(goal_id: int):
+    log = st.session_state.get(SS_PROGRESS, [])
     events = [e for e in log if e.get("goal_id") == goal_id]
     completed = sum(1 for e in events if e.get("event") == "completed")
     missed = sum(1 for e in events if e.get("event") == "missed")
@@ -315,7 +374,6 @@ def goal_progress_summary(goal_id: int):
 # ----------------------------
 st.set_page_config(page_title="One-Page Planner", layout="wide")
 
-# Secrets guard
 needed = ("drive_folder_id", "gcp_service_account", "edit_password")
 missing = [k for k in needed if k not in st.secrets]
 if missing:
@@ -325,15 +383,23 @@ if missing:
 editor_login_ui()
 can_edit = is_editor()
 
-#ensure_folder_access_or_stop()
+# Drive check ONCE per session (read-only)
 ensure_drive_ready_once_or_stop()
 
-
-# Load from Drive once per session unless user hits "Reload"
-drive_data = load_data()
 week = current_iso_week()
 
+# Load planner_data.json ONCE per session
 if SS_WORKING not in st.session_state:
+    try:
+        drive_data = load_data_from_drive()  # one read at startup
+    except Exception as e:
+        st.error(
+            "Could not load planner_data.json from Drive right now.\n\n"
+            "You can still use the app locally and Save later.\n"
+        )
+        st.exception(e)
+        drive_data = default_data()
+
     st.session_state[SS_WORKING] = copy.deepcopy(drive_data)
     st.session_state[SS_LOADED_AT] = drive_data.get("updated_at")
     clear_dirty()
@@ -341,71 +407,95 @@ if SS_WORKING not in st.session_state:
 data = st.session_state[SS_WORKING]
 
 # ----------------------------
-# Top save/reload bar
+# Top bar: Save / Reload / Revert / Load progress
 # ----------------------------
-barA, barB, barC, barD = st.columns([1.2, 1.2, 1.2, 3.0])
+barA, barB, barC, barD, barE = st.columns([1.1, 1.1, 1.1, 1.5, 3.2])
 
 with barA:
-    save_disabled = (not can_edit) or saving() or (not is_dirty())
-    if st.button("💾 Save", disabled=save_disabled, key="btn_save_all"):
+    if st.button("💾 Save", disabled=(not can_edit or saving() or not is_dirty()), key="btn_save"):
         st.session_state[SS_SAVING] = True
         try:
-            with st.spinner("Saving to Google Drive…"):
-                # Optional: warn if Drive changed since we loaded (basic conflict detection)
-                latest = load_data()
-                latest_updated = latest.get("updated_at")
-                loaded_updated = st.session_state.get(SS_LOADED_AT)
+            with st.spinner("Saving planner_data.json to Drive…"):
+                # basic "someone else updated Drive" warning (doesn't block)
+                try:
+                    latest = load_data_from_drive()
+                    if (
+                        st.session_state.get(SS_LOADED_AT)
+                        and latest.get("updated_at")
+                        and latest.get("updated_at") != st.session_state.get(SS_LOADED_AT)
+                    ):
+                        st.warning(
+                            "Drive version changed since you loaded. "
+                            "Saving will overwrite the Drive version."
+                        )
+                except Exception:
+                    # If Drive is flaky, still attempt save; retries will handle transient issues
+                    pass
 
-                if loaded_updated and latest_updated and latest_updated != loaded_updated:
-                    st.warning(
-                        "Heads up: planner_data.json was updated in Drive since you loaded it. "
-                        "Saving now will overwrite the Drive version."
-                    )
-
-                save_data(data)  # <-- single API write for planner_data.json
-                st.session_state[SS_LOADED_AT] = data.get("updated_at")  # updated by save_data()
+                save_data_to_drive(data)  # SINGLE WRITE CALL for planner_data.json
+                st.session_state[SS_LOADED_AT] = data.get("updated_at")
                 clear_dirty()
+
             st.success("Saved.")
         finally:
             st.session_state[SS_SAVING] = False
         st.rerun()
 
 with barB:
-    reload_disabled = saving()
-    if st.button("🔄 Reload", disabled=reload_disabled, key="btn_reload_from_drive"):
-        fresh = load_data()
-        st.session_state[SS_WORKING] = copy.deepcopy(fresh)
-        st.session_state[SS_LOADED_AT] = fresh.get("updated_at")
-        clear_dirty()
-        st.info("Reloaded from Drive.")
+    if st.button("🔄 Reload", disabled=saving(), key="btn_reload"):
+        st.session_state[SS_SAVING] = True
+        try:
+            with st.spinner("Reloading planner_data.json from Drive…"):
+                fresh = load_data_from_drive()
+                st.session_state[SS_WORKING] = copy.deepcopy(fresh)
+                st.session_state[SS_LOADED_AT] = fresh.get("updated_at")
+                clear_dirty()
+            st.info("Reloaded.")
+        finally:
+            st.session_state[SS_SAVING] = False
         st.rerun()
 
 with barC:
-    revert_disabled = saving() or (not is_dirty())
-    if st.button("↩️ Revert", disabled=revert_disabled, key="btn_revert_local"):
-        # revert local edits back to last loaded Drive snapshot
-        fresh = load_data()
-        st.session_state[SS_WORKING] = copy.deepcopy(fresh)
-        st.session_state[SS_LOADED_AT] = fresh.get("updated_at")
-        clear_dirty()
-        st.info("Reverted to Drive version.")
+    if st.button("↩️ Revert", disabled=(saving() or not is_dirty()), key="btn_revert"):
+        # revert local edits to the last loaded state (Drive snapshot)
+        st.session_state[SS_SAVING] = True
+        try:
+            with st.spinner("Reverting to Drive version…"):
+                fresh = load_data_from_drive()
+                st.session_state[SS_WORKING] = copy.deepcopy(fresh)
+                st.session_state[SS_LOADED_AT] = fresh.get("updated_at")
+                clear_dirty()
+            st.info("Reverted.")
+        finally:
+            st.session_state[SS_SAVING] = False
         st.rerun()
 
 with barD:
+    if st.button("📥 Load progress log", disabled=saving(), key="btn_load_progress"):
+        st.session_state[SS_SAVING] = True
+        try:
+            with st.spinner("Loading progress_log.json from Drive…"):
+                st.session_state[SS_PROGRESS] = load_progress_log_from_drive()
+            st.success("Progress log loaded.")
+        finally:
+            st.session_state[SS_SAVING] = False
+        st.rerun()
+
+with barE:
     if not can_edit:
-        st.info("👀 View-only mode. Editing is disabled.")
+        st.info("👀 View-only mode.")
     else:
         if is_dirty():
-            st.warning("Unsaved changes (local only) — click **Save** to write to Drive.")
+            st.warning("Unsaved changes (local only). Click **Save** to write to Drive.")
         else:
-            st.caption("All changes saved.")
+            st.caption("All changes saved (or no changes).")
 
 st.title("One-Page Planner")
 st.caption(f"Week: **{week}**")
 
-st.divider()
-
-# Purpose + Terms
+# ----------------------------
+# Purpose + Terms (local only)
+# ----------------------------
 colA, colB = st.columns(2)
 with colA:
     new_purpose = st.text_area("Purpose", data.get("purpose", ""), height=100, disabled=(not can_edit or saving()))
@@ -422,7 +512,9 @@ if can_edit and not saving():
 
 st.divider()
 
-# Add Goal
+# ----------------------------
+# Add Goal (local only)
+# ----------------------------
 with st.expander("➕ Add Goal", expanded=False):
     g_summary = st.text_input("Goal summary", key="g_summary", disabled=(not can_edit or saving()))
     g_deadline = st.date_input("Deadline", value=date.today(), key="g_deadline", disabled=(not can_edit or saving()))
@@ -444,13 +536,15 @@ with st.expander("➕ Add Goal", expanded=False):
             mark_dirty()
             st.success(f"Created Goal ({gid}).")
 
-# Add Task
+# ----------------------------
+# Add Task (local only)
+# ----------------------------
 with st.expander("➕ Add Task", expanded=False):
     if not data["goals"]:
         st.info("Create a goal first.")
     else:
         t_summary = st.text_input("Task summary", key="t_summary", disabled=(not can_edit or saving()))
-        goal_options = {f'Goal {g["id"]}: {g["id"]} — {g["summary"]}': g["id"] for g in data["goals"]}
+        goal_options = {f'Goal {g["id"]}: {g["summary"]}': g["id"] for g in data["goals"]}
         selected_goal_label = st.selectbox(
             "Parent goal (required)",
             list(goal_options.keys()),
@@ -478,7 +572,9 @@ with st.expander("➕ Add Task", expanded=False):
 
 st.divider()
 
-# Weekly Tasks
+# ----------------------------
+# Weekly Tasks (local until Save)
+# ----------------------------
 st.subheader("Weekly Tasks (local until Save)")
 
 if not data["tasks"]:
@@ -514,12 +610,11 @@ else:
 
 st.divider()
 
+# ----------------------------
 # Close Week
+# ----------------------------
 st.subheader("Close Week")
 
-# NOTE: This uses local working data for statuses.
-# It writes progress_log.json immediately (separate file), but planner_data.json changes
-# (resetting statuses + last_week_closed) remain local until you hit Save.
 if data.get("last_week_closed") == week:
     st.info("This week has already been closed/logged.")
 else:
@@ -556,56 +651,71 @@ else:
                 "summary": t["summary"],
             })
 
-        append_progress_events(events)
+        # This DOES write to Drive (progress_log.json).
+        # If you want this also buffered until Save, say so and I’ll change it.
+        try:
+            append_progress_events(events)
+        except Exception as e:
+            st.error("Failed to write progress_log.json to Drive right now.")
+            st.exception(e)
+            st.stop()
 
-        # reset tasks locally (persist when you hit Save)
         for t in data["tasks"]:
             t["status"] = "In Progress"
 
         data["last_week_closed"] = week
         mark_dirty()
 
-        st.success("Week logged. Tasks reset locally. Click 💾 Save to persist planner_data.json.")
+        st.success("Week logged. Planner reset locally. Click 💾 Save to persist planner_data.json.")
         st.rerun()
 
 st.divider()
 
-# Goal Progress Summary
+# ----------------------------
+# Goal Progress Summary (NO automatic Drive calls)
+# ----------------------------
 st.subheader("Goal Progress Summary")
 
-if not data["goals"]:
-    st.info("No goals yet.")
+if SS_PROGRESS not in st.session_state:
+    st.info("Progress log not loaded. Click **📥 Load progress log** at the top to view history.")
 else:
-    for g in data["goals"]:
-        with st.expander(f"📊 Goal {g['id']}: {g['summary']}"):
-            completed, missed, total, rate, events = goal_progress_summary(g["id"])
-            st.metric("Completion rate", f"{rate}%", f"{completed}/{total} (completed/total)")
-            st.write(f"Missed: **{missed}**")
+    if not data["goals"]:
+        st.info("No goals yet.")
+    else:
+        for g in data["goals"]:
+            with st.expander(f"📊 Goal {g['id']}: {g['summary']}"):
+                completed, missed, total, rate, events = goal_progress_summary_cached(g["id"])
+                st.metric("Completion rate", f"{rate}%", f"{completed}/{total} (completed/total)")
+                st.write(f"Missed: **{missed}**")
 
-            if not events:
-                st.caption("No log entries yet for this goal.")
-            else:
-                st.write("Recent log entries (newest last):")
-                for e in events[-50:]:
-                    emoji = "✅" if e.get("event") == "completed" else "❌"
-                    st.write(f"{emoji} **{e.get('week','')}** — {e.get('task_id','')} — {e.get('summary','')}")
+                if not events:
+                    st.caption("No log entries yet for this goal.")
+                else:
+                    st.write("Recent log entries (newest last):")
+                    for e in events[-50:]:
+                        emoji = "✅" if e.get("event") == "completed" else "❌"
+                        st.write(f"{emoji} **{e.get('week','')}** — {e.get('task_id','')} — {e.get('summary','')}")
 
 st.divider()
 
-# Downloads
+# ----------------------------
+# Downloads (NO automatic Drive calls)
+# ----------------------------
 st.download_button(
-    "Download planner_data.json (local state)",
+    "Download planner_data.json (local working copy)",
     data=json.dumps(data, indent=2),
     file_name="planner_data.json",
     mime="application/json",
     key="dl_state",
 )
 
-progress_log = load_progress_log()
-st.download_button(
-    "Download progress_log.json",
-    data=json.dumps(progress_log, indent=2),
-    file_name="progress_log.json",
-    mime="application/json",
-    key="dl_log",
-)
+if SS_PROGRESS in st.session_state:
+    st.download_button(
+        "Download progress_log.json (cached)",
+        data=json.dumps(st.session_state[SS_PROGRESS], indent=2),
+        file_name="progress_log.json",
+        mime="application/json",
+        key="dl_log_cached",
+    )
+else:
+    st.caption("Load progress log to enable progress_log.json download.")
