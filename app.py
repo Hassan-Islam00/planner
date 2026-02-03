@@ -364,9 +364,23 @@ st.divider()
 # Weekly Tasks
 st.subheader("Weekly Tasks (persisting list)")
 
+def saving() -> bool:
+    return bool(st.session_state.get("_saving", False))
+
+def safe_save_data(data: dict) -> None:
+    st.session_state["_saving"] = True
+    try:
+        with st.spinner("Saving…"):
+            save_data(data)
+    finally:
+        st.session_state["_saving"] = False
+
+
 if not data["tasks"]:
     st.info("No tasks yet.")
 else:
+    changed_any = False  # <-- coalesce flag
+
     cols = st.columns(3)
     for i, t in enumerate(data["tasks"]):
         with cols[i % 3]:
@@ -383,19 +397,28 @@ else:
                 TASK_STATUSES,
                 index=TASK_STATUSES.index(current_status),
                 key=f"task_status_{t['id']}",
-                disabled=not can_edit
+                disabled=(not can_edit or saving())
             )
 
+            # update in-memory only; save once after the loop
             if can_edit and new_status != current_status:
                 t["status"] = new_status
-                save_data(data)
+                changed_any = True
 
-            if st.button("Delete task", key=f"del_task_{t['id']}", disabled=not can_edit):
+            if st.button(
+                "Delete task",
+                key=f"del_task_{t['id']}",
+                disabled=(not can_edit or saving())
+            ):
                 data["tasks"] = [tt for tt in data["tasks"] if tt["id"] != t["id"]]
-                save_data(data)
+                safe_save_data(data)
                 st.rerun()
 
-st.divider()
+    # single save for all status changes triggered this rerun
+    if can_edit and changed_any and not saving():
+        safe_save_data(data)
+        st.rerun()
+v
 
 # Close Week
 st.subheader("Close Week")
