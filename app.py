@@ -91,6 +91,37 @@ def saving() -> bool:
     return bool(st.session_state.get(SS_SAVING, False))
 
 
+def ensure_drive_ready_once_or_stop():
+    # Only run the Drive folder check once per browser session
+    if st.session_state.get("_drive_ready", False):
+        return
+
+    svc = drive_service()
+    folder_id = _folder_id()
+    try:
+        meta = svc.files().get(
+            fileId=folder_id,
+            fields="id,name,mimeType",
+            supportsAllDrives=True,
+        ).execute()
+        if meta.get("mimeType") != "application/vnd.google-apps.folder":
+            st.error("drive_folder_id does not point to a folder. Check the ID.")
+            st.stop()
+
+        st.session_state["_drive_ready"] = True  # success => don't check again
+
+    except Exception as e:
+        st.error(
+            "Google Drive folder is not accessible to the service account.\n\n"
+            "Fix:\n"
+            "1) Confirm drive_folder_id is the folder ID (from /drive/folders/<ID>)\n"
+            "2) Share the folder with the service account email as Editor\n"
+        )
+        st.exception(e)
+        st.stop()
+
+
+
 def mark_dirty():
     st.session_state[SS_DIRTY] = True
 
@@ -294,7 +325,9 @@ if missing:
 editor_login_ui()
 can_edit = is_editor()
 
-ensure_folder_access_or_stop()
+#ensure_folder_access_or_stop()
+ensure_drive_ready_once_or_stop()
+
 
 # Load from Drive once per session unless user hits "Reload"
 drive_data = load_data()
