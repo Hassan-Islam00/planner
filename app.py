@@ -2,6 +2,7 @@ import json
 import re
 import io
 import hmac
+import copy
 from dataclasses import dataclass, asdict
 from datetime import date, datetime, timezone
 
@@ -21,6 +22,12 @@ GOAL_STATUSES = ["In Progress", "Done", "Psyche"]
 DATA_FILENAME = "planner_data.json"
 PROGRESS_FILENAME = "progress_log.json"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# Session-state keys
+SS_WORKING = "working_data"          # local working copy (browser session)
+SS_LOADED_AT = "working_loaded_at"   # last known updated_at from drive when we loaded
+SS_DIRTY = "working_dirty"
+SS_SAVING = "working_saving"
 
 # ----------------------------
 # Data model
@@ -78,31 +85,22 @@ def editor_login_ui():
 
 
 # ----------------------------
-# Saving / freeze helpers
+# Local-state helpers
 # ----------------------------
 def saving() -> bool:
-    return bool(st.session_state.get("_saving", False))
+    return bool(st.session_state.get(SS_SAVING, False))
 
 
-def safe_save_data(data: dict) -> None:
-    st.session_state["_saving"] = True
-    try:
-        with st.spinner("Saving…"):
-            save_data(data)
-    finally:
-        st.session_state["_saving"] = False
+def mark_dirty():
+    st.session_state[SS_DIRTY] = True
 
 
-def mark_dirty() -> None:
-    st.session_state["_dirty"] = True
-
-
-def clear_dirty() -> None:
-    st.session_state["_dirty"] = False
+def clear_dirty():
+    st.session_state[SS_DIRTY] = False
 
 
 def is_dirty() -> bool:
-    return bool(st.session_state.get("_dirty", False))
+    return bool(st.session_state.get(SS_DIRTY, False))
 
 
 # ----------------------------
@@ -231,6 +229,8 @@ def load_progress_log() -> list[dict]:
 
 
 def append_progress_events(events: list[dict]) -> None:
+    # NOTE: progress log is separate from planner_data.json.
+    # This function writes to Drive immediately (by design) when you close a week.
     log = load_progress_log()
     log.extend(events)
 
@@ -296,59 +296,95 @@ can_edit = is_editor()
 
 ensure_folder_access_or_stop()
 
-# Load persisted data ONCE
-data = load_data()
+# Load from Drive once per session unless user hits "Reload"
+drive_data = load_data()
 week = current_iso_week()
 
-# Keep a working copy in session_state so widget edits don't instantly persist
-if "working_data" not in st.session_state:
-    st.session_state["working_data"] = json.loads(json.dumps(data))
+if SS_WORKING not in st.session_state:
+    st.session_state[SS_WORKING] = copy.deepcopy(drive_data)
+    st.session_state[SS_LOADED_AT] = drive_data.get("updated_at")
     clear_dirty()
 
-wd = st.session_state["working_data"]
+data = st.session_state[SS_WORKING]
 
 # ----------------------------
-# Save bar (no auto-save)
+# Top save/reload bar
 # ----------------------------
-bar1, bar2, bar3 = st.columns([1, 2, 2])
-with bar1:
-    if can_edit:
-        if st.button("💾 Save", disabled=(saving() or not is_dirty()), key="btn_save_all"):
-            safe_save_data(wd)
-            clear_dirty()
+barA, barB, barC, barD = st.columns([1.2, 1.2, 1.2, 3.0])
+
+with barA:
+    save_disabled = (not can_edit) or saving() or (not is_dirty())
+    if st.button("💾 Save", disabled=save_disabled, key="btn_save_all"):
+        st.session_state[SS_SAVING] = True
+        try:
+            with st.spinner("Saving to Google Drive…"):
+                # Optional: warn if Drive changed since we loaded (basic conflict detection)
+                latest = load_data()
+                latest_updated = latest.get("updated_at")
+                loaded_updated = st.session_state.get(SS_LOADED_AT)
+
+                if loaded_updated and latest_updated and latest_updated != loaded_updated:
+                    st.warning(
+                        "Heads up: planner_data.json was updated in Drive since you loaded it. "
+                        "Saving now will overwrite the Drive version."
+                    )
+
+                save_data(data)  # <-- single API write for planner_data.json
+                st.session_state[SS_LOADED_AT] = data.get("updated_at")  # updated by save_data()
+                clear_dirty()
             st.success("Saved.")
-            st.rerun()
-with bar2:
-    if can_edit and is_dirty():
-        st.warning("Unsaved changes")
-    elif can_edit:
-        st.caption("All changes saved")
-with bar3:
-    if can_edit:
-        if st.button("↩️ Revert", disabled=(saving() or not is_dirty()), key="btn_revert_all"):
-            st.session_state["working_data"] = json.loads(json.dumps(load_data()))
-            clear_dirty()
-            st.info("Reverted to last saved.")
-            st.rerun()
+        finally:
+            st.session_state[SS_SAVING] = False
+        st.rerun()
+
+with barB:
+    reload_disabled = saving()
+    if st.button("🔄 Reload", disabled=reload_disabled, key="btn_reload_from_drive"):
+        fresh = load_data()
+        st.session_state[SS_WORKING] = copy.deepcopy(fresh)
+        st.session_state[SS_LOADED_AT] = fresh.get("updated_at")
+        clear_dirty()
+        st.info("Reloaded from Drive.")
+        st.rerun()
+
+with barC:
+    revert_disabled = saving() or (not is_dirty())
+    if st.button("↩️ Revert", disabled=revert_disabled, key="btn_revert_local"):
+        # revert local edits back to last loaded Drive snapshot
+        fresh = load_data()
+        st.session_state[SS_WORKING] = copy.deepcopy(fresh)
+        st.session_state[SS_LOADED_AT] = fresh.get("updated_at")
+        clear_dirty()
+        st.info("Reverted to Drive version.")
+        st.rerun()
+
+with barD:
+    if not can_edit:
+        st.info("👀 View-only mode. Editing is disabled.")
+    else:
+        if is_dirty():
+            st.warning("Unsaved changes (local only) — click **Save** to write to Drive.")
+        else:
+            st.caption("All changes saved.")
 
 st.title("One-Page Planner")
 st.caption(f"Week: **{week}**")
-if not can_edit:
-    st.info("👀 View-only mode. Editing is disabled.")
+
+st.divider()
 
 # Purpose + Terms
 colA, colB = st.columns(2)
 with colA:
-    new_purpose = st.text_area("Purpose", wd.get("purpose", ""), height=100, disabled=(not can_edit or saving()))
+    new_purpose = st.text_area("Purpose", data.get("purpose", ""), height=100, disabled=(not can_edit or saving()))
 with colB:
-    new_terms = st.text_area("Terms / Rules", wd.get("terms", ""), height=100, disabled=(not can_edit or saving()))
+    new_terms = st.text_area("Terms / Rules", data.get("terms", ""), height=100, disabled=(not can_edit or saving()))
 
-if can_edit:
-    if new_purpose != wd.get("purpose", ""):
-        wd["purpose"] = new_purpose
+if can_edit and not saving():
+    if new_purpose != data.get("purpose"):
+        data["purpose"] = new_purpose
         mark_dirty()
-    if new_terms != wd.get("terms", ""):
-        wd["terms"] = new_terms
+    if new_terms != data.get("terms"):
+        data["terms"] = new_terms
         mark_dirty()
 
 st.divider()
@@ -364,8 +400,8 @@ with st.expander("➕ Add Goal", expanded=False):
         if not g_summary.strip():
             st.error("Goal summary can't be empty.")
         else:
-            gid = next_goal_id(wd["goals"])
-            wd["goals"].append(asdict(Goal(
+            gid = next_goal_id(data["goals"])
+            data["goals"].append(asdict(Goal(
                 id=gid,
                 status=g_status,
                 summary=g_summary.strip(),
@@ -377,11 +413,11 @@ with st.expander("➕ Add Goal", expanded=False):
 
 # Add Task
 with st.expander("➕ Add Task", expanded=False):
-    if not wd["goals"]:
+    if not data["goals"]:
         st.info("Create a goal first.")
     else:
         t_summary = st.text_input("Task summary", key="t_summary", disabled=(not can_edit or saving()))
-        goal_options = {f'Goal {g["id"]}: {g["summary"]}': g["id"] for g in wd["goals"]}
+        goal_options = {f'Goal {g["id"]}: {g["id"]} — {g["summary"]}': g["id"] for g in data["goals"]}
         selected_goal_label = st.selectbox(
             "Parent goal (required)",
             list(goal_options.keys()),
@@ -390,15 +426,15 @@ with st.expander("➕ Add Task", expanded=False):
         )
         selected_goal_id = goal_options[selected_goal_label]
 
-        preview_id = next_task_id_for_goal(wd["tasks"], selected_goal_id)
+        preview_id = next_task_id_for_goal(data["tasks"], selected_goal_id)
         st.caption(f"Task ID will be: **{preview_id}**")
 
         if st.button("Create Task", key="btn_create_task", disabled=(not can_edit or saving())):
             if not t_summary.strip():
                 st.error("Task summary is required.")
             else:
-                tid = next_task_id_for_goal(wd["tasks"], selected_goal_id)
-                wd["tasks"].append(asdict(Task(
+                tid = next_task_id_for_goal(data["tasks"], selected_goal_id)
+                data["tasks"].append(asdict(Task(
                     id=tid,
                     summary=t_summary.strip(),
                     parent_goal_id=selected_goal_id,
@@ -410,13 +446,13 @@ with st.expander("➕ Add Task", expanded=False):
 st.divider()
 
 # Weekly Tasks
-st.subheader("Weekly Tasks (persisting list)")
+st.subheader("Weekly Tasks (local until Save)")
 
-if not wd["tasks"]:
+if not data["tasks"]:
     st.info("No tasks yet.")
 else:
     cols = st.columns(3)
-    for i, t in enumerate(wd["tasks"]):
+    for i, t in enumerate(data["tasks"]):
         with cols[i % 3]:
             st.markdown(f"### {t['id']}")
             st.write(t["summary"])
@@ -434,16 +470,12 @@ else:
                 disabled=(not can_edit or saving())
             )
 
-            if can_edit and new_status != current_status:
+            if can_edit and not saving() and new_status != current_status:
                 t["status"] = new_status
                 mark_dirty()
 
-            if st.button(
-                "Delete task",
-                key=f"del_task_{t['id']}",
-                disabled=(not can_edit or saving())
-            ):
-                wd["tasks"] = [tt for tt in wd["tasks"] if tt["id"] != t["id"]]
+            if st.button("Delete task", key=f"del_task_{t['id']}", disabled=(not can_edit or saving())):
+                data["tasks"] = [tt for tt in data["tasks"] if tt["id"] != t["id"]]
                 mark_dirty()
                 st.rerun()
 
@@ -452,13 +484,13 @@ st.divider()
 # Close Week
 st.subheader("Close Week")
 
-# IMPORTANT: Close-week uses *working data* too.
-# You must SAVE before/after if you want these changes persisted.
-
-if wd.get("last_week_closed") == week:
+# NOTE: This uses local working data for statuses.
+# It writes progress_log.json immediately (separate file), but planner_data.json changes
+# (resetting statuses + last_week_closed) remain local until you hit Save.
+if data.get("last_week_closed") == week:
     st.info("This week has already been closed/logged.")
 else:
-    in_progress = [t for t in wd["tasks"] if t.get("status") == "In Progress"]
+    in_progress = [t for t in data["tasks"] if t.get("status") == "In Progress"]
     close_disabled = bool(in_progress)
 
     if in_progress:
@@ -473,7 +505,7 @@ else:
         disabled=(close_disabled or not can_edit or saving())
     ):
         events = []
-        for t in wd["tasks"]:
+        for t in data["tasks"]:
             status = t.get("status", "In Progress")
             if status == "Completed":
                 ev = "completed"
@@ -491,28 +523,27 @@ else:
                 "summary": t["summary"],
             })
 
-        # progress log is separate, so we do persist this immediately
         append_progress_events(events)
 
-        # reset working tasks for the new week
-        for t in wd["tasks"]:
+        # reset tasks locally (persist when you hit Save)
+        for t in data["tasks"]:
             t["status"] = "In Progress"
 
-        wd["last_week_closed"] = week
+        data["last_week_closed"] = week
         mark_dirty()
 
-        st.success("Week logged. Statuses reset in memory. Click 💾 Save to persist.")
+        st.success("Week logged. Tasks reset locally. Click 💾 Save to persist planner_data.json.")
         st.rerun()
 
 st.divider()
 
-# Goal Progress Summary (reads from persisted progress log)
+# Goal Progress Summary
 st.subheader("Goal Progress Summary")
 
-if not wd["goals"]:
+if not data["goals"]:
     st.info("No goals yet.")
 else:
-    for g in wd["goals"]:
+    for g in data["goals"]:
         with st.expander(f"📊 Goal {g['id']}: {g['summary']}"):
             completed, missed, total, rate, events = goal_progress_summary(g["id"])
             st.metric("Completion rate", f"{rate}%", f"{completed}/{total} (completed/total)")
@@ -528,10 +559,10 @@ else:
 
 st.divider()
 
-# Downloads (download working state + persisted log)
+# Downloads
 st.download_button(
-    "Download planner_data.json",
-    data=json.dumps(wd, indent=2),
+    "Download planner_data.json (local state)",
+    data=json.dumps(data, indent=2),
     file_name="planner_data.json",
     mime="application/json",
     key="dl_state",
