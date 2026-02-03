@@ -271,6 +271,21 @@ ensure_folder_access_or_stop()
 data = load_data()
 week = current_iso_week()
 
+# ----------------------------
+# Auto-reset tasks on new week
+# ----------------------------
+if data.get("last_week_closed") != week:
+    changed = False
+    for t in data.get("tasks", []):
+        if t.get("status") != "In Progress":
+            t["status"] = "In Progress"
+            changed = True
+
+    # Only save if we actually changed anything (avoids extra Drive writes)
+    if changed:
+        save_data(data)
+
+
 st.title("One-Page Planner")
 st.caption(f"Week: **{week}**")
 if not can_edit:
