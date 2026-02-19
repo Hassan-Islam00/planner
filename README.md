@@ -1,0 +1,1 @@
+Silly thing I (vibe-coded) just to use as a personal planner. Uses streamlit to host a simple version of a Jira-style Kanban board. I need to keep this repo public to be able to use it haha so dont judge too much!
